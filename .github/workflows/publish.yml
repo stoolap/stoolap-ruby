@@ -24,10 +24,11 @@ jobs:
         uses: oxidize-rb/actions/fetch-ci-data@v1
         with:
           supported-ruby-platforms: |
-            # arm-linux: 32-bit ARM is not a sensible target for an embedded
-            #            analytics database.
+            # arm-linux: 32-bit ARM, not a sensible target for an embedded database.
             # x64-mingw32: superseded by x64-mingw-ucrt for Ruby 3.1+.
-            exclude: [arm-linux, x64-mingw32]
+            # aarch64-mingw-ucrt: no rb-sys-dock image exists for ARM Windows.
+            # aarch64-linux-musl: no rb-sys-dock image for ARM musl.
+            exclude: [arm-linux, x64-mingw32, aarch64-mingw-ucrt, aarch64-linux-musl]
           stable-ruby-versions: |
             exclude: [head]
 
