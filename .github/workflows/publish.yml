@@ -119,7 +119,7 @@ jobs:
           ruby-version: "3.3"
 
       - name: Download all gem artifacts into pkg/
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: "{cross-gem-*,source-gem}"
           merge-multiple: true
