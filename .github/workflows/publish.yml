@@ -11,6 +11,7 @@ concurrency:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   ci-data:
@@ -39,7 +40,7 @@ jobs:
       matrix:
         ruby-platform: ${{ fromJSON(needs.ci-data.outputs.result).supported-ruby-platforms }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: ruby/setup-ruby@v1
         with:
@@ -65,7 +66,7 @@ jobs:
           "
 
       - name: Upload precompiled gem
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cross-gem-${{ matrix.ruby-platform }}
           path: pkg/*-${{ matrix.ruby-platform }}.gem
@@ -76,7 +77,7 @@ jobs:
     name: Build source gem
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: oxidize-rb/actions/setup-ruby-and-rust@v1
         with:
@@ -98,7 +99,7 @@ jobs:
         run: bundle exec rake build
 
       - name: Upload source gem
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: source-gem
           path: pkg/stoolap-*.gem
@@ -111,15 +112,18 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     environment: rubygems
+    permissions:
+      contents: write
+      id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: "3.3"
 
       - name: Download all gem artifacts into pkg/
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: "{cross-gem-*,source-gem}"
           merge-multiple: true
@@ -128,20 +132,12 @@ jobs:
       - name: List gems to publish
         run: ls -l pkg/
 
+      - name: Configure trusted publishing credentials
+        uses: rubygems/configure-rubygems-credentials@v1
+
       - name: Push gems to RubyGems
         working-directory: pkg/
-        env:
-          GEM_HOST_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}
         run: |
-          if [ -z "${GEM_HOST_API_KEY:-}" ]; then
-            echo "::error::RUBYGEMS_API_KEY secret is not set"
-            exit 1
-          fi
-          mkdir -p "$HOME/.gem"
-          touch "$HOME/.gem/credentials"
-          chmod 0600 "$HOME/.gem/credentials"
-          printf -- "---\n:rubygems_api_key: %s\n" "$GEM_HOST_API_KEY" > "$HOME/.gem/credentials"
-
           for gem in *.gem; do
             [ -f "$gem" ] || continue
             echo "pushing $gem"
@@ -151,7 +147,6 @@ jobs:
             set -e
             if [ $status -ne 0 ]; then
               sed 's/^/::error:: /' push.out
-              # Tolerate "Repushing of gem" so re-runs of the same tag succeed.
               if ! grep -q "Repushing of gem" push.out; then
                 exit $status
               fi
