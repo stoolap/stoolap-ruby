@@ -47,6 +47,9 @@ jobs:
         with:
           ruby-version: "3.3"
 
+      - name: Remove Cargo.lock (v4 format incompatible with rb-sys-dock Rust)
+        run: rm -f Cargo.lock
+
       - name: Cross-compile precompiled native gem
         uses: oxidize-rb/actions/cross-gem@v1
         with:
