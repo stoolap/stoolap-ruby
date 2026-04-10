@@ -1,0 +1,34 @@
+# Rust build artifacts
+/target/
+/ext/stoolap/target/
+
+# Compiled native extension
+/lib/stoolap/stoolap.bundle
+/lib/stoolap/stoolap.so
+/lib/stoolap/stoolap.dll
+/lib/stoolap/*.bundle
+/lib/stoolap/*.so
+/lib/stoolap/*.dll
+/tmp/
+
+# Gem build
+/pkg/
+
+# Bundler
+/.bundle/
+/vendor/bundle/
+
+# Coverage
+/coverage/
+
+# IDE
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+alloc_profile.rb

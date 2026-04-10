@@ -1,0 +1,39 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
+    labels:
+      - dependencies
+      - github-actions
+
+  - package-ecosystem: bundler
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "deps"
+    labels:
+      - dependencies
+      - ruby
+    ignore:
+      # rb_sys is bumped together with the magnus version; let humans drive it.
+      - dependency-name: rb_sys
+
+  - package-ecosystem: cargo
+    directory: "/ext/stoolap"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "deps"
+    labels:
+      - dependencies
+      - rust
+    ignore:
+      # Pinned to the stoolap engine version we are released against; bumped
+      # by hand alongside the gem version.
+      - dependency-name: stoolap
+      - dependency-name: magnus

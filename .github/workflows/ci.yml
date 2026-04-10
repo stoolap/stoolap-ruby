@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags-ignore: ['**']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci-data:
+    name: Fetch supported Ruby versions
+    runs-on: ubuntu-latest
+    outputs:
+      result: ${{ steps.fetch.outputs.result }}
+    steps:
+      - id: fetch
+        uses: oxidize-rb/actions/fetch-ci-data@v1
+        with:
+          stable-ruby-versions: |
+            exclude: [head]
+
+  lint:
+    name: Lint (rustfmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oxidize-rb/actions/setup-ruby-and-rust@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+          cargo-cache: true
+          cache-version: v1
+
+      - name: rustfmt --check
+        working-directory: ext/stoolap
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        working-directory: ext/stoolap
+        run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: Test - Ruby ${{ matrix.ruby }} (${{ matrix.os }})
+    needs: ci-data
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        ruby: ${{ fromJSON(needs.ci-data.outputs.result).stable-ruby-versions }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oxidize-rb/actions/setup-ruby-and-rust@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true
+          cargo-cache: true
+          cache-version: v1
+
+      - name: Compile native extension
+        run: bundle exec rake compile
+
+      - name: Run test suite (enforces >=80% line coverage)
+        run: bundle exec rake test
+
+      - name: Run benchmark smoke test
+        shell: bash
+        run: |
+          # Only a tiny smoke run so we catch regressions in the benchmark
+          # harness itself. The full benchmark is run manually, not in CI.
+          bundle exec ruby -Ilib -e "
+            require 'stoolap'
+            db = Stoolap::Database.open(':memory:')
+            db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)')
+            stmt = db.prepare('INSERT INTO t VALUES (\$1, \$2)')
+            1000.times { |i| stmt.execute([i, \"row#{i}\"]) }
+            rows = db.query('SELECT * FROM t ORDER BY id')
+            raise 'bad row count' unless rows.length == 1000
+            raise 'bad last row' unless rows.last == { 'id' => 999, 'v' => 'row999' }
+            db.close
+            puts 'smoke ok'
+          "
+
+  source-gem:
+    name: Source gem install + require
+    needs: ci-data
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oxidize-rb/actions/setup-ruby-and-rust@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+          cargo-cache: true
+          cache-version: v1
+
+      - name: Build source gem
+        run: bundle exec rake build
+
+      - name: Install source gem and smoke-require
+        shell: bash
+        run: |
+          gem install --verbose pkg/stoolap-*.gem
+          ruby -rstoolap -e "
+            db = Stoolap::Database.open(':memory:')
+            db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY)')
+            db.execute('INSERT INTO t VALUES (\$1)', [1])
+            row = db.query_one('SELECT * FROM t')
+            raise 'source gem smoke failed' unless row == { 'id' => 1 }
+            puts 'source gem ok'
+          "
