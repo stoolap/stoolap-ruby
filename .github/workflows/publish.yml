@@ -13,67 +13,17 @@ permissions:
   contents: write
   id-token: write
 
+# NOTE: Cross-compiled precompiled gems are disabled for now because
+# the rb-sys-dock Docker images ship Rust 1.77 which cannot compile
+# crates that use the Rust 2024 edition (stabilized in 1.85+). Our
+# dependency tree pulls in such crates (home, clap_lex). Once rb-sys
+# updates their Docker images, re-enable the cross-gems job and add
+# it back to the release job's `needs:` list.
+#
+# Until then, only the source gem is published. Users need a Rust
+# toolchain to install it (`gem install stoolap` compiles from source).
+
 jobs:
-  ci-data:
-    name: Fetch supported Ruby platforms + versions
-    runs-on: ubuntu-latest
-    outputs:
-      result: ${{ steps.fetch.outputs.result }}
-    steps:
-      - id: fetch
-        uses: oxidize-rb/actions/fetch-ci-data@v1
-        with:
-          supported-ruby-platforms: |
-            # arm-linux: 32-bit ARM, not a sensible target for an embedded database.
-            # x64-mingw32: superseded by x64-mingw-ucrt for Ruby 3.1+.
-            # aarch64-mingw-ucrt: no rb-sys-dock image exists for ARM Windows.
-            # aarch64-linux-musl: no rb-sys-dock image for ARM musl.
-            exclude: [arm-linux, x64-mingw32, aarch64-mingw-ucrt, aarch64-linux-musl]
-          stable-ruby-versions: |
-            exclude: [head]
-
-  cross-gems:
-    name: Cross-compile - ${{ matrix.ruby-platform }}
-    needs: ci-data
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        ruby-platform: ${{ fromJSON(needs.ci-data.outputs.result).supported-ruby-platforms }}
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: "3.3"
-
-      - name: Cross-compile precompiled native gem
-        uses: oxidize-rb/actions/cross-gem@v1
-        with:
-          platform: ${{ matrix.ruby-platform }}
-          ruby-versions: ${{ join(fromJSON(needs.ci-data.outputs.result).stable-ruby-versions, ',') }}
-
-      - name: Smoke install precompiled gem (Linux x86_64 only)
-        if: matrix.ruby-platform == 'x86_64-linux'
-        run: |
-          gem install --verbose pkg/stoolap-*-x86_64-linux.gem
-          ruby -rstoolap -e "
-            db = Stoolap::Database.open(':memory:')
-            db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY)')
-            db.execute('INSERT INTO t VALUES (\$1)', [1])
-            row = db.query_one('SELECT * FROM t')
-            raise 'precompiled gem smoke failed' unless row == { 'id' => 1 }
-            puts 'precompiled gem ok'
-          "
-
-      - name: Upload precompiled gem
-        uses: actions/upload-artifact@v7
-        with:
-          name: cross-gem-${{ matrix.ruby-platform }}
-          path: pkg/*-${{ matrix.ruby-platform }}.gem
-          if-no-files-found: error
-          retention-days: 1
-
   source-gem:
     name: Build source gem
     runs-on: ubuntu-latest
@@ -109,7 +59,7 @@ jobs:
 
   release:
     name: Publish to RubyGems + GitHub Release
-    needs: [cross-gems, source-gem]
+    needs: [source-gem]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     environment: rubygems
@@ -123,11 +73,10 @@ jobs:
         with:
           ruby-version: "3.3"
 
-      - name: Download all gem artifacts into pkg/
+      - name: Download source gem
         uses: actions/download-artifact@v8
         with:
-          pattern: "{cross-gem-*,source-gem}"
-          merge-multiple: true
+          name: source-gem
           path: pkg/
 
       - name: List gems to publish
@@ -136,7 +85,7 @@ jobs:
       - name: Configure trusted publishing credentials
         uses: rubygems/configure-rubygems-credentials@v1
 
-      - name: Push gems to RubyGems
+      - name: Push gem to RubyGems
         working-directory: pkg/
         run: |
           for gem in *.gem; do
