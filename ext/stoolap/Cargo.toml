@@ -1,6 +1,6 @@
 [package]
 name = "stoolap"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 authors = ["Stoolap Contributors"]
 license = "Apache-2.0"
@@ -14,7 +14,7 @@ name = "stoolap"
 crate-type = ["cdylib"]
 
 [dependencies]
-stoolap = "0.4.0"
+stoolap = "0.4.1"
 magnus = "0.8"
 chrono = "0.4"
 

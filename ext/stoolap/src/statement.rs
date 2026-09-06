@@ -72,10 +72,6 @@ impl PreparedStatement {
         &self.plan
     }
 
-    pub(crate) fn sql_text(&self) -> &str {
-        &self.sql_text
-    }
-
     /// Return the cached column-key array, creating it from `rows.columns()`
     /// on first call. The returned `RArray` is rooted through this struct's
     /// `mark` callback and is safe to hold across subsequent Ruby calls.
