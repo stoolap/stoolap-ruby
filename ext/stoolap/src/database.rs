@@ -12,13 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::os::raw::{c_char, c_long};
 use std::sync::Arc;
 
-use magnus::{prelude::*, scan_args::scan_args, Error, RArray, RHash, Ruby, Value};
+use magnus::{
+    prelude::*,
+    rb_sys::{AsRawValue, FromRawValue},
+    Error, RArray, RHash, Ruby, TryConvert, Value,
+};
+use rb_sys::VALUE;
 
 use stoolap::api::{Database as ApiDatabase, Rows};
+use stoolap::core::Row;
 
-use crate::error::{raise, to_magnus};
+use crate::error::{arity_error, raise, to_magnus};
 use crate::statement::PreparedStatement;
 use crate::transaction::Transaction;
 use crate::value::{parse_params, value_to_ruby, BindParams};
@@ -108,7 +115,6 @@ impl Database {
     /// Returns total rows affected.
     pub fn execute_batch(&self, sql: String, params_list: RArray) -> Result<i64, Error> {
         use stoolap::api::ParamVec;
-        use stoolap::parser::Parser;
 
         let mut all_params: Vec<ParamVec> = Vec::with_capacity(params_list.len());
         for item in params_list.into_iter() {
@@ -122,22 +128,12 @@ impl Database {
             }
         }
 
-        let mut parser = Parser::new(&sql);
-        let program = parser.parse_program().map_err(|e| raise(e.to_string()))?;
-        if program.statements.len() > 1 {
-            return Err(raise(
-                "execute_batch accepts exactly one SQL statement; use exec() for multi-statement SQL",
-            ));
-        }
-        let stmt = program
-            .statements
-            .first()
-            .ok_or_else(|| raise("No SQL statement found"))?;
+        let stmt = self.db.prepare(&sql).map_err(to_magnus)?;
 
         let mut tx = self.db.begin().map_err(to_magnus)?;
         let mut total = 0i64;
         for params in all_params {
-            total += tx.execute_prepared(stmt, params).map_err(to_magnus)?;
+            total += stmt.execute_in(&mut tx, params).map_err(to_magnus)?;
         }
         tx.commit().map_err(to_magnus)?;
         Ok(total)
@@ -151,7 +147,7 @@ impl Database {
     /// Begin a transaction.
     pub fn begin_transaction(&self) -> Result<Transaction, Error> {
         let tx = self.db.begin().map_err(to_magnus)?;
-        Ok(Transaction::from_tx(tx))
+        Ok(Transaction::from_tx(tx, Arc::clone(&self.db)))
     }
 
     /// Close the database connection.
@@ -172,8 +168,11 @@ impl Database {
 
 /// Parse `(sql, params=nil)` from a method args slice.
 fn parse_sql_args(args: &[Value]) -> Result<(String, Option<Value>), Error> {
-    let scanned = scan_args::<(String,), (Option<Value>,), (), (), (), ()>(args)?;
-    Ok((scanned.required.0, scanned.optional.0))
+    match *args {
+        [sql] => Ok((String::try_convert(sql)?, None)),
+        [sql, params] => Ok((String::try_convert(sql)?, Some(params))),
+        _ => Err(arity_error(args.len(), 1, 2)),
+    }
 }
 
 /// Translate user-friendly paths into a Stoolap DSN.
@@ -188,49 +187,58 @@ fn translate_path(path: &str) -> String {
     }
 }
 
+/// Rows up to this many columns build their Hash with one
+/// `rb_hash_bulk_insert` from a stack buffer; wider rows insert per key.
+const BULK_COLS: usize = 32;
+
+/// Build the column-key array for `rows`: frozen, interned UTF-8 strings
+/// (`rb_enc_interned_str`), so an ad hoc query looks its keys up in Ruby's
+/// fstring table instead of allocating a String per column per call, and
+/// `rb_hash_aset` stores them without the dup + freeze a plain String key
+/// costs. The array is a stack local, so the conservative GC marks it and
+/// through it every key while rows are built.
+pub fn column_keys(ruby: &Ruby, rows: &Rows) -> RArray {
+    let cols = rows.columns();
+    let keys = ruby.ary_new_capa(cols.len());
+    for c in cols {
+        unsafe {
+            let key = rb_sys::rb_enc_interned_str(
+                c.as_ptr() as *const c_char,
+                c.len() as c_long,
+                rb_sys::rb_utf8_encoding(),
+            );
+            rb_sys::rb_ary_push(keys.as_raw(), key);
+        }
+    }
+    keys
+}
+
 /// Convert a `Rows` iterator into an Array of Hashes (String keys).
+pub fn rows_to_hashes(rows: Rows) -> Result<RArray, Error> {
+    let ruby = Ruby::get().expect("must hold the Ruby VM lock");
+    let keys = column_keys(&ruby, &rows);
+    rows_to_hashes_with_keys(&ruby, rows, keys)
+}
+
+/// Same as `rows_to_hashes` but reuses a caller-provided key array
+/// (typically held on a `PreparedStatement` across calls).
 ///
 /// Uses `rows.advance() + rows.current_row()` which yields `&Row` directly
 /// with zero `take_row()` move and zero ResultRow wrapping per iteration.
-/// Column-name strings are built once into a Ruby `RArray` held as a stack
-/// local, so Ruby's conservative GC scanner can find the `RArray` pointer
-/// on the C stack and trace through to mark every column `RString`. A
-/// `Vec<RString>` would store the keys in a heap-allocated buffer that
-/// Ruby's GC cannot see, and the strings could be collected mid-iteration,
-/// segfaulting on the next `aset`.
-pub fn rows_to_hashes(rows: Rows) -> Result<RArray, Error> {
-    let ruby = Ruby::get().expect("must hold the Ruby VM lock");
-    let col_count = rows.columns().len();
-    let key_cache = ruby.ary_new_capa(col_count);
-    for c in rows.columns() {
-        let s = ruby.str_new(c);
-        s.freeze();
-        key_cache.push(s)?;
-    }
-    rows_to_hashes_with_keys(&ruby, rows, key_cache)
-}
-
-/// Same as `rows_to_hashes` but reuses a caller-provided key cache
-/// (typically held on a `PreparedStatement` across calls).
+/// Every Ruby object is created and stored with direct `rb_*` calls rather
+/// than magnus' `push` / `aset`, which wrap each call in `rb_protect`. The
+/// targets are fresh, unfrozen Arrays and Hashes keyed by frozen Strings,
+/// so the calls cannot raise.
 pub fn rows_to_hashes_with_keys(
     ruby: &Ruby,
     mut rows: Rows,
-    key_cache: RArray,
+    keys: RArray,
 ) -> Result<RArray, Error> {
     let col_count = rows.columns().len();
     let result = ruby.ary_new();
     while rows.advance() {
-        let row = rows.current_row();
-        let hash = ruby.hash_new();
-        for i in 0..col_count {
-            let key = key_cache.entry::<Value>(i as isize)?;
-            let val = match row.get(i) {
-                Some(v) => value_to_ruby(v)?,
-                None => ruby.qnil().as_value(),
-            };
-            hash.aset(key, val)?;
-        }
-        result.push(hash)?;
+        let hash = row_to_hash(ruby, rows.current_row(), keys, col_count)?;
+        unsafe { rb_sys::rb_ary_push(result.as_raw(), hash) };
     }
     if let Some(err) = rows.error() {
         return Err(to_magnus(err));
@@ -241,40 +249,61 @@ pub fn rows_to_hashes_with_keys(
 /// Take the first row from `Rows` as a Hash, or `nil`.
 pub fn first_row_to_hash(rows: Rows) -> Result<Value, Error> {
     let ruby = Ruby::get().expect("must hold the Ruby VM lock");
-    let col_count = rows.columns().len();
-    let key_cache = ruby.ary_new_capa(col_count);
-    for c in rows.columns() {
-        let s = ruby.str_new(c);
-        s.freeze();
-        key_cache.push(s)?;
-    }
-    first_row_to_hash_with_keys(&ruby, rows, key_cache)
+    let keys = column_keys(&ruby, &rows);
+    first_row_to_hash_with_keys(&ruby, rows, keys)
 }
 
-/// Same as `first_row_to_hash` but with a caller-provided key cache.
+/// Same as `first_row_to_hash` but with a caller-provided key array.
 pub fn first_row_to_hash_with_keys(
     ruby: &Ruby,
     mut rows: Rows,
-    key_cache: RArray,
+    keys: RArray,
 ) -> Result<Value, Error> {
     if rows.advance() {
         let col_count = rows.columns().len();
-        let row = rows.current_row();
-        let hash = ruby.hash_new();
-        for i in 0..col_count {
-            let key = key_cache.entry::<Value>(i as isize)?;
-            let val = match row.get(i) {
-                Some(v) => value_to_ruby(v)?,
-                None => ruby.qnil().as_value(),
-            };
-            hash.aset(key, val)?;
-        }
-        return Ok(hash.as_value());
+        let hash = row_to_hash(ruby, rows.current_row(), keys, col_count)?;
+        return Ok(unsafe { Value::from_raw(hash) });
     }
     if let Some(err) = rows.error() {
         return Err(to_magnus(err));
     }
     Ok(ruby.qnil().as_value())
+}
+
+/// Build one row Hash. Up to `BULK_COLS` columns, the key/value pairs are
+/// laid out in a stack buffer (scanned by the conservative GC, so values
+/// created for later columns cannot collect earlier ones) and inserted by
+/// a single `rb_hash_bulk_insert`, which sizes the table for them
+/// (`rb_hash_new_capa` would need Ruby 3.2).
+fn row_to_hash(ruby: &Ruby, row: &Row, keys: RArray, col_count: usize) -> Result<VALUE, Error> {
+    let nil = ruby.qnil().as_raw();
+    unsafe {
+        let hash = rb_sys::rb_hash_new();
+        let keys_ptr = rb_sys::RARRAY_CONST_PTR(keys.as_raw());
+        if col_count <= BULK_COLS {
+            let mut pairs = [nil; BULK_COLS * 2];
+            for i in 0..col_count {
+                pairs[2 * i] = *keys_ptr.add(i);
+                pairs[2 * i + 1] = match row.get(i) {
+                    Some(v) => value_to_ruby(ruby, v)?.as_raw(),
+                    None => nil,
+                };
+            }
+            rb_sys::rb_hash_bulk_insert((col_count * 2) as c_long, pairs.as_ptr(), hash);
+        } else {
+            for i in 0..col_count {
+                let val = match row.get(i) {
+                    Some(v) => value_to_ruby(ruby, v)?.as_raw(),
+                    None => nil,
+                };
+                rb_sys::rb_hash_aset(hash, *keys_ptr.add(i), val);
+            }
+        }
+        // Keep `keys` live on the stack until here (like RB_GC_GUARD) so GC
+        // cannot reclaim the array while `keys_ptr` is still being read.
+        std::hint::black_box(keys);
+        Ok(hash)
+    }
 }
 
 /// Convert `Rows` into `{ "columns" => [..], "rows" => [[..], ..] }`.
@@ -299,15 +328,17 @@ pub fn rows_to_raw_with_keys(ruby: &Ruby, mut rows: Rows, col_arr: RArray) -> Re
     let row_arr = ruby.ary_new();
     while rows.advance() {
         let row = rows.current_row();
-        let inner = ruby.ary_new_capa(col_count);
-        for i in 0..col_count {
-            let val = match row.get(i) {
-                Some(v) => value_to_ruby(v)?,
-                None => ruby.qnil().as_value(),
-            };
-            inner.push(val)?;
+        unsafe {
+            let inner = rb_sys::rb_ary_new_capa(col_count as c_long);
+            for i in 0..col_count {
+                let val = match row.get(i) {
+                    Some(v) => value_to_ruby(ruby, v)?.as_raw(),
+                    None => ruby.qnil().as_raw(),
+                };
+                rb_sys::rb_ary_push(inner, val);
+            }
+            rb_sys::rb_ary_push(row_arr.as_raw(), inner);
         }
-        row_arr.push(inner)?;
     }
     if let Some(err) = rows.error() {
         return Err(to_magnus(err));

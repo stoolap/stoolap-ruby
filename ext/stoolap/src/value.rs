@@ -13,16 +13,19 @@
 // limitations under the License.
 
 use std::cell::RefCell;
+use std::os::raw::c_int;
 
 use chrono::{TimeZone, Utc};
 use magnus::{
     prelude::*,
     r_hash::ForEach,
+    rb_sys::{AsRawValue, FromRawValue},
     value::{Lazy, ReprValue},
     Error, Float, Integer, RArray, RClass, RHash, RModule, RString, Ruby, Symbol, TryConvert,
     Value,
 };
 
+use rb_sys::timespec;
 use stoolap::api::{NamedParams, ParamVec};
 use stoolap::core::Value as SValue;
 
@@ -30,15 +33,12 @@ use crate::error::{raise, type_error};
 
 /// Cached `Time` class. Lazy-initialised on first use; subsequent calls
 /// are a direct pointer load, avoiding `const_get("Time")` on every
-/// timestamp parameter and every timestamp result value.
+/// timestamp parameter.
 static TIME_CLASS: Lazy<RClass> = Lazy::new(|ruby| {
     ruby.class_object()
         .const_get("Time")
         .expect("Ruby core class Time must exist")
 });
-
-/// Cached `:nsec` symbol used for `Time.at(secs, nsecs, :nsec)`.
-static NSEC_SYM: Lazy<Symbol> = Lazy::new(|ruby| ruby.to_symbol("nsec"));
 
 /// Cached `JSON` module used to serialise Hash/Array params.
 /// `lib/stoolap.rb` does `require "json"` so the constant is
@@ -114,11 +114,12 @@ pub fn ruby_to_value(val: Value) -> Result<SValue, Error> {
         return Ok(SValue::null_unknown());
     }
 
-    // Boolean
-    if val.is_kind_of(ruby.class_true_class()) {
+    // Boolean: true and false are immediates, so compare them directly
+    // instead of looking up the class of every parameter.
+    if val.as_raw() == ruby.qtrue().as_raw() {
         return Ok(SValue::Boolean(true));
     }
-    if val.is_kind_of(ruby.class_false_class()) {
+    if val.as_raw() == ruby.qfalse().as_raw() {
         return Ok(SValue::Boolean(false));
     }
 
@@ -152,10 +153,18 @@ pub fn ruby_to_value(val: Value) -> Result<SValue, Error> {
     // Time -> Timestamp (UTC)
     let time_class = ruby.get_inner(&TIME_CLASS);
     if val.is_kind_of(time_class) {
-        let secs: i64 = val.funcall("to_i", ())?;
-        let nsecs: i64 = val.funcall("nsec", ())?;
+        // `rb_time_timespec` raises for a Time outside the system range, so
+        // run it under `protect` to get an `Error` instead of a longjmp.
+        let mut spec = timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        magnus::rb_sys::protect(|| {
+            spec = unsafe { rb_sys::rb_time_timespec(val.as_raw()) };
+            ruby.qnil().as_raw()
+        })?;
         let dt = Utc
-            .timestamp_opt(secs, nsecs as u32)
+            .timestamp_opt(spec.tv_sec as i64, spec.tv_nsec as u32)
             .single()
             .ok_or_else(|| raise("invalid Time value"))?;
         return Ok(SValue::Timestamp(dt));
@@ -187,7 +196,7 @@ pub fn parse_params(params: Option<Value>) -> Result<BindParams, Error> {
     if let Some(hash) = RHash::from_value(params) {
         let mut named = NamedParams::new();
         let mut err: Option<Error> = None;
-        let _ = hash.foreach(|key: Value, val: Value| {
+        hash.foreach(|key: Value, val: Value| {
             // Extract the key as `&str` without an intermediate owned String.
             // Symbols return a `Cow<str>` from `name()`; RStrings expose their
             // bytes via `unsafe as_str` (valid while the Hash holds the key).
@@ -234,7 +243,7 @@ pub fn parse_params(params: Option<Value>) -> Result<BindParams, Error> {
                     Ok(ForEach::Stop)
                 }
             }
-        });
+        })?;
         if let Some(e) = err {
             return Err(e);
         }
@@ -253,9 +262,11 @@ pub fn parse_params(params: Option<Value>) -> Result<BindParams, Error> {
     Err(type_error("Parameters must be an Array, Hash, or nil"))
 }
 
+/// `rb_time_timespec_new` offset that makes a UTC Time (`INT_MAX - 1`).
+const UTC_OFFSET: c_int = c_int::MAX - 1;
+
 /// Convert a Stoolap Value to a Ruby Value.
-pub fn value_to_ruby(val: &SValue) -> Result<Value, Error> {
-    let ruby = Ruby::get().expect("must hold the Ruby VM lock");
+pub fn value_to_ruby(ruby: &Ruby, val: &SValue) -> Result<Value, Error> {
     match val {
         SValue::Null(_) => Ok(ruby.qnil().as_value()),
         SValue::Boolean(b) => Ok(if *b {
@@ -267,17 +278,13 @@ pub fn value_to_ruby(val: &SValue) -> Result<Value, Error> {
         SValue::Float(f) => Ok(ruby.float_from_f64(*f).as_value()),
         SValue::Text(s) => Ok(ruby.str_new(s.as_str()).as_value()),
         SValue::Timestamp(ts) => {
-            // `Time.at(secs, nsecs, :nsec).utc` — Ruby's `Time#utc`
-            // mutates the receiver in place and returns self, so the
-            // chain is a single Time allocation. Cached Time class and
-            // :nsec symbol avoid const_get + intern per-row.
-            let time_class = ruby.get_inner(&TIME_CLASS);
-            let nsec_sym = ruby.get_inner(&NSEC_SYM);
-            let secs = ts.timestamp();
-            let nsecs = ts.timestamp_subsec_nanos() as i64;
-            let t: Value = time_class.funcall("at", (secs, nsecs, nsec_sym))?;
-            let utc: Value = t.funcall("utc", ())?;
-            Ok(utc)
+            // One C call builds the UTC Time directly, instead of
+            // `Time.at(secs, nsecs, :nsec).utc` through two method calls.
+            let spec = timespec {
+                tv_sec: ts.timestamp() as _,
+                tv_nsec: ts.timestamp_subsec_nanos() as _,
+            };
+            Ok(unsafe { Value::from_raw(rb_sys::rb_time_timespec_new(&spec, UTC_OFFSET)) })
         }
         SValue::Extension(_) => {
             if let Some(floats) = val.as_vector_f32() {

@@ -91,6 +91,6 @@ class TestPersistence < Minitest::Test
   end
 
   def test_version_constant
-    assert_match(/\A\d+\.\d+\.\d+\z/, Stoolap::VERSION)
+    assert_match(/\A\d+\.\d+\.\d+(\.[a-z]+\.\d+)?\z/, Stoolap::VERSION)
   end
 end

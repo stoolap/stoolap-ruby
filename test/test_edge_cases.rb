@@ -69,6 +69,36 @@ class TestEdgeCases < Minitest::Test
     assert_equal 320, row["c32"]
   end
 
+  def test_duplicate_column_names_keep_last_value
+    @db.exec("CREATE TABLE edge (id INTEGER PRIMARY KEY, v INTEGER)")
+    @db.execute("INSERT INTO edge VALUES ($1, $2)", [1, 5])
+    row = @db.query_one("SELECT id AS x, v AS x FROM edge")
+    assert_equal({ "x" => 5 }, row)
+  end
+
+  def test_duplicate_column_names_in_wide_rows
+    @db.exec("CREATE TABLE edge (id INTEGER PRIMARY KEY, v INTEGER)")
+    @db.execute("INSERT INTO edge VALUES ($1, $2)", [1, 5])
+    # 20 columns use the bulk-insert path, 40 the per-key path.
+    [20, 40].each do |n|
+      cols = (0...n).map { |i| "#{i} AS c#{i % 3}" }.join(", ")
+      row = @db.query_one("SELECT #{cols} FROM edge")
+      expected = (0...n).each_with_object({}) { |i, h| h["c#{i % 3}"] = i }
+      assert_equal expected, row
+    end
+  end
+
+  def test_multi_statement_sql_runs_every_statement
+    @db.exec("CREATE TABLE edge (id INTEGER PRIMARY KEY, v INTEGER)")
+    changes = @db.execute_batch(
+      "INSERT INTO edge VALUES ($1, $2); INSERT INTO edge VALUES ($1 + 1000, $2)",
+      [[1, 1], [2, 1]]
+    )
+    assert_equal 2, changes
+    assert_equal 4, @db.query("SELECT * FROM edge").length
+    assert_equal [{ "2" => 2 }], @db.prepare("SELECT 1; SELECT 2").query
+  end
+
   def test_many_rows
     @db.exec("CREATE TABLE edge (id INTEGER PRIMARY KEY, v INTEGER)")
     @db.execute_batch(

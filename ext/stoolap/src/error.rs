@@ -46,6 +46,19 @@ pub fn raise<S: Into<String>>(msg: S) -> Error {
     Error::new(ruby.get_inner(&ERROR_CLASS), msg.into())
 }
 
+/// Build the `ArgumentError` Ruby raises for a wrong argument count.
+///
+/// Methods taking optional arguments match on the argument slice instead of
+/// using magnus' `scan_args`, which formats a spec string and runs
+/// `rb_scan_args` under `rb_protect` on every call.
+pub fn arity_error(given: usize, min: usize, max: usize) -> Error {
+    let ruby = Ruby::get().expect("must hold the Ruby VM lock");
+    Error::new(
+        ruby.exception_arg_error(),
+        format!("wrong number of arguments (given {given}, expected {min}..{max})"),
+    )
+}
+
 /// Build a `TypeError` for invalid Ruby types.
 pub fn type_error<S: Into<String>>(msg: S) -> Error {
     let ruby = Ruby::get().expect("must hold the Ruby VM lock");

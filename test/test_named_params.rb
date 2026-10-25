@@ -104,4 +104,20 @@ class TestNamedParams < Minitest::Test
     assert_equal [[1]], raw["rows"]
     tx.rollback
   end
+
+  def test_missing_named_param_is_an_error
+    err = assert_raises(Stoolap::Error) do
+      @db.query("SELECT * FROM users WHERE id = :id", {})
+    end
+    assert_match(/named parameter :id has no value/, err.message)
+
+    stmt = @db.prepare("SELECT * FROM users WHERE id = :id")
+    err = assert_raises(Stoolap::Error) { stmt.query({ name: "Alice" }) }
+    assert_match(/named parameter :id has no value/, err.message)
+
+    tx = @db.begin_transaction
+    err = assert_raises(Stoolap::Error) { tx.query_prepared(stmt, {}) }
+    assert_match(/named parameter :id has no value/, err.message)
+    tx.rollback
+  end
 end

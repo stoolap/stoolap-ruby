@@ -12,15 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use magnus::{scan_args::scan_args, Error, RArray, RHash, Value};
+use magnus::{Error, RArray, RHash, TryConvert, Value};
 
-use stoolap::api::Transaction as ApiTransaction;
-use stoolap::CachedPlanRef;
+use stoolap::api::{
+    Database as ApiDatabase, Statement as ApiStatement, Transaction as ApiTransaction,
+};
 
 use crate::database::{first_row_to_hash, rows_to_hashes, rows_to_raw};
-use crate::error::{raise, to_magnus};
+use crate::error::{arity_error, raise, to_magnus};
 use crate::statement::PreparedStatement;
 use crate::value::{parse_params, BindParams};
 
@@ -32,12 +33,14 @@ use crate::value::{parse_params, BindParams};
 #[magnus::wrap(class = "Stoolap::Transaction", free_immediately, size)]
 pub struct Transaction {
     tx: Mutex<Option<ApiTransaction>>,
+    db: Arc<ApiDatabase>,
 }
 
 impl Transaction {
-    pub fn from_tx(tx: ApiTransaction) -> Self {
+    pub fn from_tx(tx: ApiTransaction, db: Arc<ApiDatabase>) -> Self {
         Self {
             tx: Mutex::new(Some(tx)),
+            db,
         }
     }
 
@@ -103,7 +106,6 @@ impl Transaction {
     /// Execute the same SQL with multiple parameter sets. Returns total rows affected.
     pub fn execute_batch(&self, sql: String, params_list: RArray) -> Result<i64, Error> {
         use stoolap::api::ParamVec;
-        use stoolap::parser::Parser;
 
         let mut all_params: Vec<ParamVec> = Vec::with_capacity(params_list.len());
         for item in params_list.into_iter() {
@@ -117,22 +119,12 @@ impl Transaction {
             }
         }
 
-        let mut parser = Parser::new(&sql);
-        let program = parser.parse_program().map_err(|e| raise(e.to_string()))?;
-        if program.statements.len() > 1 {
-            return Err(raise(
-                "execute_batch accepts exactly one SQL statement; use exec() for multi-statement SQL",
-            ));
-        }
-        let stmt = program
-            .statements
-            .first()
-            .ok_or_else(|| raise("No SQL statement found"))?;
+        let stmt = self.db.prepare(&sql).map_err(to_magnus)?;
 
         self.with_tx(|tx| {
             let mut total = 0i64;
             for params in all_params {
-                total += tx.execute_prepared(stmt, params).map_err(to_magnus)?;
+                total += stmt.execute_in(tx, params).map_err(to_magnus)?;
             }
             Ok(total)
         })
@@ -140,59 +132,43 @@ impl Transaction {
 
     /// Execute a prepared statement within the transaction. Returns rows affected.
     pub fn execute_prepared(&self, args: &[Value]) -> Result<i64, Error> {
-        let (plan, params) = parse_stmt_args(args)?;
+        let (stmt, params) = parse_stmt_args(args)?;
         let bind = parse_params(params)?;
         self.with_tx(|tx| match bind {
-            BindParams::Positional(p) => tx
-                .execute_prepared(plan.statement.as_ref(), p)
-                .map_err(to_magnus),
-            BindParams::Named(n) => tx
-                .execute_prepared_named(plan.statement.as_ref(), n)
-                .map_err(to_magnus),
+            BindParams::Positional(p) => stmt.execute_in(tx, p).map_err(to_magnus),
+            BindParams::Named(n) => stmt.execute_named_in(tx, n).map_err(to_magnus),
         })
     }
 
     /// Query rows using a prepared statement. Returns Array of Hashes.
     pub fn query_prepared(&self, args: &[Value]) -> Result<RArray, Error> {
-        let (plan, params) = parse_stmt_args(args)?;
+        let (stmt, params) = parse_stmt_args(args)?;
         let bind = parse_params(params)?;
         let rows = self.with_tx(|tx| match bind {
-            BindParams::Positional(p) => tx
-                .query_prepared(plan.statement.as_ref(), p)
-                .map_err(to_magnus),
-            BindParams::Named(n) => tx
-                .query_prepared_named(plan.statement.as_ref(), n)
-                .map_err(to_magnus),
+            BindParams::Positional(p) => stmt.query_in(tx, p).map_err(to_magnus),
+            BindParams::Named(n) => stmt.query_named_in(tx, n).map_err(to_magnus),
         })?;
         rows_to_hashes(rows)
     }
 
     /// Query a single row using a prepared statement. Returns Hash or nil.
     pub fn query_one_prepared(&self, args: &[Value]) -> Result<Value, Error> {
-        let (plan, params) = parse_stmt_args(args)?;
+        let (stmt, params) = parse_stmt_args(args)?;
         let bind = parse_params(params)?;
         let rows = self.with_tx(|tx| match bind {
-            BindParams::Positional(p) => tx
-                .query_prepared(plan.statement.as_ref(), p)
-                .map_err(to_magnus),
-            BindParams::Named(n) => tx
-                .query_prepared_named(plan.statement.as_ref(), n)
-                .map_err(to_magnus),
+            BindParams::Positional(p) => stmt.query_in(tx, p).map_err(to_magnus),
+            BindParams::Named(n) => stmt.query_named_in(tx, n).map_err(to_magnus),
         })?;
         first_row_to_hash(rows)
     }
 
     /// Query rows using a prepared statement in raw format.
     pub fn query_raw_prepared(&self, args: &[Value]) -> Result<RHash, Error> {
-        let (plan, params) = parse_stmt_args(args)?;
+        let (stmt, params) = parse_stmt_args(args)?;
         let bind = parse_params(params)?;
         let rows = self.with_tx(|tx| match bind {
-            BindParams::Positional(p) => tx
-                .query_prepared(plan.statement.as_ref(), p)
-                .map_err(to_magnus),
-            BindParams::Named(n) => tx
-                .query_prepared_named(plan.statement.as_ref(), n)
-                .map_err(to_magnus),
+            BindParams::Positional(p) => stmt.query_in(tx, p).map_err(to_magnus),
+            BindParams::Named(n) => stmt.query_named_in(tx, n).map_err(to_magnus),
         })?;
         rows_to_raw(rows)
     }
@@ -232,13 +208,19 @@ impl Transaction {
 }
 
 fn parse_sql_args(args: &[Value]) -> Result<(String, Option<Value>), Error> {
-    let scanned = scan_args::<(String,), (Option<Value>,), (), (), (), ()>(args)?;
-    Ok((scanned.required.0, scanned.optional.0))
+    match *args {
+        [sql] => Ok((String::try_convert(sql)?, None)),
+        [sql, params] => Ok((String::try_convert(sql)?, Some(params))),
+        _ => Err(arity_error(args.len(), 1, 2)),
+    }
 }
 
-fn parse_stmt_args(args: &[Value]) -> Result<(CachedPlanRef, Option<Value>), Error> {
-    use magnus::TryConvert;
-    let scanned = scan_args::<(Value,), (Option<Value>,), (), (), (), ()>(args)?;
-    let stmt: &PreparedStatement = TryConvert::try_convert(scanned.required.0)?;
-    Ok((stmt.plan().clone(), scanned.optional.0))
+fn parse_stmt_args(args: &[Value]) -> Result<(&ApiStatement, Option<Value>), Error> {
+    let (stmt, params) = match *args {
+        [stmt] => (stmt, None),
+        [stmt, params] => (stmt, Some(params)),
+        _ => return Err(arity_error(args.len(), 1, 2)),
+    };
+    let stmt: &PreparedStatement = TryConvert::try_convert(stmt)?;
+    Ok((stmt.inner(), params))
 }

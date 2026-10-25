@@ -12,20 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::{Arc, OnceLock};
+use std::cell::RefCell;
+use std::sync::Arc;
 
 use magnus::{
-    gc, prelude::*, scan_args::scan_args, value::Opaque, DataTypeFunctions, Error, RArray, RHash,
-    Ruby, TypedData, Value,
+    gc, prelude::*, value::Opaque, DataTypeFunctions, Error, RArray, RHash, Ruby, TypedData, Value,
 };
 
-use stoolap::api::{Database as ApiDatabase, Rows};
-use stoolap::CachedPlanRef;
+use stoolap::api::{Database as ApiDatabase, Rows, Statement as ApiStatement};
 
 use crate::database::{
-    first_row_to_hash_with_keys, rows_to_hashes_with_keys, rows_to_raw_with_keys,
+    column_keys, first_row_to_hash_with_keys, rows_to_hashes_with_keys, rows_to_raw_with_keys,
 };
-use crate::error::{raise, to_magnus};
+use crate::error::{arity_error, raise, to_magnus};
 use crate::value::{parse_params, BindParams};
 
 /// A prepared SQL statement.
@@ -40,18 +39,17 @@ use crate::value::{parse_params, BindParams};
 #[magnus(class = "Stoolap::PreparedStatement", free_immediately, size, mark)]
 pub struct PreparedStatement {
     db: Arc<ApiDatabase>,
-    sql_text: String,
-    plan: CachedPlanRef,
-    /// Lazily populated on first query that yields rows. `OnceLock` so
-    /// the init closure runs exactly once; `Opaque<RArray>` is `Send +
-    /// Sync` and the contained `RArray` is kept alive by the `mark`
-    /// callback below.
-    column_keys: OnceLock<Opaque<RArray>>,
+    stmt: ApiStatement,
+    /// Populated on the first query and rebuilt when the result columns
+    /// change, which the column names kept beside the keys detect without
+    /// reading Ruby objects. `Opaque<RArray>` is `Send + Sync` and the
+    /// contained `RArray` is kept alive by the `mark` callback below.
+    column_keys: RefCell<Option<(Vec<String>, Opaque<RArray>)>>,
 }
 
 impl DataTypeFunctions for PreparedStatement {
     fn mark(&self, marker: &gc::Marker) {
-        if let Some(keys) = self.column_keys.get() {
+        if let Some((_, keys)) = &*self.column_keys.borrow() {
             marker.mark(*keys);
         }
     }
@@ -59,37 +57,35 @@ impl DataTypeFunctions for PreparedStatement {
 
 impl PreparedStatement {
     pub fn new(db: Arc<ApiDatabase>, sql: &str) -> Result<Self, Error> {
-        let plan = db.cached_plan(sql).map_err(to_magnus)?;
+        let stmt = db.prepare(sql).map_err(to_magnus)?;
         Ok(Self {
             db,
-            sql_text: sql.to_string(),
-            plan,
-            column_keys: OnceLock::new(),
+            stmt,
+            column_keys: RefCell::new(None),
         })
     }
 
-    pub(crate) fn plan(&self) -> &CachedPlanRef {
-        &self.plan
+    pub(crate) fn inner(&self) -> &ApiStatement {
+        &self.stmt
     }
 
     /// Return the cached column-key array, creating it from `rows.columns()`
-    /// on first call. The returned `RArray` is rooted through this struct's
-    /// `mark` callback and is safe to hold across subsequent Ruby calls.
+    /// on first call and again whenever the columns no longer match it (a
+    /// schema change after prepare). The returned `RArray` is rooted
+    /// through this struct's `mark` callback and is safe to hold across
+    /// subsequent Ruby calls.
     fn ensure_column_keys(&self, ruby: &Ruby, rows: &Rows) -> RArray {
-        let opaque = self.column_keys.get_or_init(|| {
-            let cols = rows.columns();
-            let arr = ruby.ary_new_capa(cols.len());
-            for c in cols {
-                let s = ruby.str_new(c);
-                s.freeze();
-                arr.push(s).expect("push to fresh RArray cannot fail");
+        if let Some((names, keys)) = &*self.column_keys.borrow() {
+            if names.as_slice() == rows.columns() {
+                return ruby.get_inner(*keys);
             }
-            // Freeze the array itself so user code that receives it from
-            // query_raw cannot mutate the internal cache (P1 safety).
-            arr.freeze();
-            Opaque::from(arr)
-        });
-        ruby.get_inner(*opaque)
+        }
+        let keys = column_keys(ruby, rows);
+        // Freeze the array itself so user code that receives it from
+        // query_raw cannot mutate the internal cache (P1 safety).
+        keys.freeze();
+        *self.column_keys.borrow_mut() = Some((rows.columns().to_vec(), Opaque::from(keys)));
+        keys
     }
 }
 
@@ -98,10 +94,9 @@ impl PreparedStatement {
     pub fn execute(&self, args: &[Value]) -> Result<i64, Error> {
         let params = parse_optional(args)?;
         let bind = parse_params(params)?;
-        let plan = self.plan.clone();
         match bind {
-            BindParams::Positional(p) => self.db.execute_plan(&plan, p).map_err(to_magnus),
-            BindParams::Named(n) => self.db.execute_named_plan(&plan, n).map_err(to_magnus),
+            BindParams::Positional(p) => self.stmt.execute(p).map_err(to_magnus),
+            BindParams::Named(n) => self.stmt.execute_named(n).map_err(to_magnus),
         }
     }
 
@@ -109,10 +104,9 @@ impl PreparedStatement {
     pub fn query(&self, args: &[Value]) -> Result<RArray, Error> {
         let params = parse_optional(args)?;
         let bind = parse_params(params)?;
-        let plan = self.plan.clone();
         let rows = match bind {
-            BindParams::Positional(p) => self.db.query_plan(&plan, p).map_err(to_magnus)?,
-            BindParams::Named(n) => self.db.query_named_plan(&plan, n).map_err(to_magnus)?,
+            BindParams::Positional(p) => self.stmt.query(p).map_err(to_magnus)?,
+            BindParams::Named(n) => self.stmt.query_named(n).map_err(to_magnus)?,
         };
         let ruby = Ruby::get().expect("must hold the Ruby VM lock");
         let keys = self.ensure_column_keys(&ruby, &rows);
@@ -123,10 +117,9 @@ impl PreparedStatement {
     pub fn query_one(&self, args: &[Value]) -> Result<Value, Error> {
         let params = parse_optional(args)?;
         let bind = parse_params(params)?;
-        let plan = self.plan.clone();
         let rows = match bind {
-            BindParams::Positional(p) => self.db.query_plan(&plan, p).map_err(to_magnus)?,
-            BindParams::Named(n) => self.db.query_named_plan(&plan, n).map_err(to_magnus)?,
+            BindParams::Positional(p) => self.stmt.query(p).map_err(to_magnus)?,
+            BindParams::Named(n) => self.stmt.query_named(n).map_err(to_magnus)?,
         };
         let ruby = Ruby::get().expect("must hold the Ruby VM lock");
         let keys = self.ensure_column_keys(&ruby, &rows);
@@ -137,10 +130,9 @@ impl PreparedStatement {
     pub fn query_raw(&self, args: &[Value]) -> Result<RHash, Error> {
         let params = parse_optional(args)?;
         let bind = parse_params(params)?;
-        let plan = self.plan.clone();
         let rows = match bind {
-            BindParams::Positional(p) => self.db.query_plan(&plan, p).map_err(to_magnus)?,
-            BindParams::Named(n) => self.db.query_named_plan(&plan, n).map_err(to_magnus)?,
+            BindParams::Positional(p) => self.stmt.query(p).map_err(to_magnus)?,
+            BindParams::Named(n) => self.stmt.query_named(n).map_err(to_magnus)?,
         };
         let ruby = Ruby::get().expect("must hold the Ruby VM lock");
         let keys = self.ensure_column_keys(&ruby, &rows);
@@ -163,11 +155,10 @@ impl PreparedStatement {
             }
         }
 
-        let stmt = self.plan.statement.as_ref();
         let mut tx = self.db.begin().map_err(to_magnus)?;
         let mut total = 0i64;
         for params in all_params {
-            total += tx.execute_prepared(stmt, params).map_err(to_magnus)?;
+            total += self.stmt.execute_in(&mut tx, params).map_err(to_magnus)?;
         }
         tx.commit().map_err(to_magnus)?;
         Ok(total)
@@ -175,15 +166,18 @@ impl PreparedStatement {
 
     /// SQL text of this prepared statement.
     pub fn sql(&self) -> String {
-        self.sql_text.clone()
+        self.stmt.sql().to_string()
     }
 
     pub fn inspect(&self) -> String {
-        format!("#<Stoolap::PreparedStatement {:?}>", self.sql_text)
+        format!("#<Stoolap::PreparedStatement {:?}>", self.stmt.sql())
     }
 }
 
 fn parse_optional(args: &[Value]) -> Result<Option<Value>, Error> {
-    let scanned = scan_args::<(), (Option<Value>,), (), (), (), ()>(args)?;
-    Ok(scanned.optional.0)
+    match *args {
+        [] => Ok(None),
+        [params] => Ok(Some(params)),
+        _ => Err(arity_error(args.len(), 0, 1)),
+    }
 }

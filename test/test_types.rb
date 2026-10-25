@@ -108,6 +108,39 @@ class TestTypes < Minitest::Test
     assert_equal 123_456_789, got.nsec
   end
 
+  def test_time_before_epoch_with_nsec
+    @db.exec("CREATE TABLE types (id INTEGER PRIMARY KEY, ts TIMESTAMP)")
+    t = Time.utc(1969, 7, 20, 20, 17, 40) + Rational(250_000_000, 1_000_000_000)
+    @db.execute("INSERT INTO types VALUES ($1, $2)", [1, t])
+    got = @db.query_one("SELECT ts FROM types WHERE id = $1", [1])["ts"]
+    assert got.utc?
+    assert_equal t, got
+  end
+
+  def test_time_in_named_params
+    @db.exec("CREATE TABLE types (id INTEGER PRIMARY KEY, ts TIMESTAMP)")
+    t = Time.utc(1969, 7, 20, 20, 17, 40) + Rational(250_000_000, 1_000_000_000)
+    @db.execute("INSERT INTO types VALUES (:id, :ts)", { id: 1, ts: t })
+    assert_equal t, @db.query_one("SELECT ts FROM types WHERE id = :id", { id: 1 })["ts"]
+  end
+
+  def test_out_of_range_time_raises_argument_error
+    @db.exec("CREATE TABLE types (id INTEGER PRIMARY KEY, ts TIMESTAMP)")
+    bad = Time.at(2**70)
+    assert_raises(ArgumentError) do
+      @db.execute("INSERT INTO types VALUES ($1, $2)", [1, bad])
+    end
+    # A raise while converting a Hash value must not be swallowed, wherever
+    # the key sits in the Hash.
+    assert_raises(ArgumentError) do
+      @db.execute("INSERT INTO types VALUES (:id, :ts)", { id: 1, ts: Time.now, extra: bad })
+    end
+    assert_raises(ArgumentError) do
+      @db.execute("INSERT INTO types VALUES (:id, :ts)", { bad: bad, id: 1, ts: Time.now })
+    end
+    assert_equal 0, @db.query("SELECT * FROM types").length
+  end
+
   def test_time_local_converted_to_utc
     @db.exec("CREATE TABLE types (id INTEGER PRIMARY KEY, ts TIMESTAMP)")
     t_local = Time.new(2025, 6, 15, 12, 0, 0, "+03:00")

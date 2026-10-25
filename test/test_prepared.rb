@@ -137,4 +137,41 @@ class TestPrepared < Minitest::Test
     tx.commit
     assert_equal "named", @db.query_one("SELECT name FROM items WHERE id = $1", [9])["name"]
   end
+
+  def test_cached_columns_follow_schema_change
+    @db.execute("INSERT INTO items VALUES ($1, $2, $3)", [1, "a", 10])
+    stmt = @db.prepare("SELECT * FROM items")
+    assert_equal({ "id" => 1, "name" => "a", "qty" => 10 }, stmt.query_one)
+
+    @db.exec("ALTER TABLE items ADD COLUMN note TEXT")
+    @db.execute("UPDATE items SET note = $1 WHERE id = $2", ["n", 1])
+    assert_equal({ "id" => 1, "name" => "a", "qty" => 10, "note" => "n" }, stmt.query_one)
+    assert_equal %w[id name qty note], stmt.query_raw["columns"]
+  end
+
+  def test_wrong_argument_count_raises_argument_error
+    stmt = @db.prepare("SELECT * FROM items")
+    assert_raises(ArgumentError) { stmt.query([], []) }
+    assert_raises(ArgumentError) { @db.query }
+    assert_raises(ArgumentError) { @db.query("SELECT 1", [], []) }
+    tx = @db.begin_transaction
+    assert_raises(ArgumentError) { tx.query_prepared }
+    tx.rollback
+  end
+
+  def test_rows_survive_gc_stress
+    @db.execute_batch("INSERT INTO items VALUES ($1, $2, $3)",
+                      (1..50).map { |i| [i, "item_#{i}", i] })
+    stmt = @db.prepare("SELECT * FROM items ORDER BY id")
+    GC.stress = true
+    rows = stmt.query
+    raw = @db.query_raw("SELECT * FROM items ORDER BY id")
+    adhoc = @db.query("SELECT name, qty FROM items ORDER BY id")
+  ensure
+    GC.stress = false
+    assert_equal 50, rows.length
+    assert_equal({ "id" => 50, "name" => "item_50", "qty" => 50 }, rows.last)
+    assert_equal [50, "item_50", 50], raw["rows"].last
+    assert_equal({ "name" => "item_1", "qty" => 1 }, adhoc.first)
+  end
 end
