@@ -164,7 +164,7 @@ pub fn ruby_to_value(val: Value) -> Result<SValue, Error> {
             ruby.qnil().as_raw()
         })?;
         let dt = Utc
-            .timestamp_opt(spec.tv_sec as i64, spec.tv_nsec as u32)
+            .timestamp_opt(spec.tv_sec, spec.tv_nsec as u32)
             .single()
             .ok_or_else(|| raise("invalid Time value"))?;
         return Ok(SValue::Timestamp(dt));
