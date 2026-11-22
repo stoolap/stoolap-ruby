@@ -16,10 +16,10 @@ Gem::Specification.new do |spec|
   spec.metadata["documentation_uri"] = "https://stoolap.io/docs/drivers/ruby/"
   spec.metadata["bug_tracker_uri"] = "https://github.com/stoolap/stoolap-ruby/issues"
 
-  # Floor at 3.1 so rb-sys-dock containers (which may run 3.1/3.2
-  # internally) can resolve the gem during cross-compilation. Our CI
-  # test matrix covers 3.3+ only; versions below 3.3 are untested.
-  spec.required_ruby_version = ">= 3.1.0"
+  # Matches the CI test matrix (3.3+); 3.1 and 3.2 are end-of-life.
+  # If cross-compiled gems come back, check that the rb-sys-dock
+  # containers run Ruby 3.3+ or they cannot resolve the gem.
+  spec.required_ruby_version = ">= 3.3.0"
   spec.required_rubygems_version = ">= 3.3.11"
 
   # Explicit allow-list so we never ship the local cargo `target/` build
